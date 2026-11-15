@@ -63,10 +63,12 @@ class StreamingPromptClient implements OpencodePromptClient {
     public readonly eventSubscription: ProgrammableEventSubscription,
   ) {}
 
-  public async createSession(): Promise<string> {
+  public async createSession(_directory: string, _options: OpencodeRunnerOptions): Promise<string> {
     this.createSessionCalls += 1;
     return this.sessionId;
   }
+
+  public async interrupt(_sessionId: string): Promise<void> {}
 
   public async prompt(
     _sessionId: string,
@@ -104,7 +106,7 @@ class StreamingPromptClient implements OpencodePromptClient {
 
 class StreamingClientFactory implements OpencodeClientFactory {
   public constructor(private readonly client: StreamingPromptClient) {}
-  public async create(): Promise<OpencodePromptClient> {
+  public async create(_baseUrl: string, _auth: { password: string }): Promise<OpencodePromptClient> {
     return this.client;
   }
 }
@@ -177,9 +179,9 @@ describe("OpencodeSdkRunner activity streaming — forwarding", () => {
         properties: { sessionID: sessionId, status: { type: "busy" } },
       },
       {
-        type: "message.part.updated",
+        type: "session.text.delta",
         properties: {
-          part: { sessionID: sessionId, type: "text", text: "hello" },
+          sessionID: sessionId,
           delta: "hel",
         },
       },
@@ -211,9 +213,9 @@ describe("OpencodeSdkRunner activity streaming — forwarding", () => {
     expect(new Date(frame0.at).toISOString()).toBe(frame0.at);
 
     const frame1 = emitter.frames[1];
-    expect(frame1.kind).toBe("message.part.updated");
+    expect(frame1.kind).toBe("session.text.delta");
     expect(frame1.payload).toEqual({
-      part: { sessionID: sessionId, type: "text", text: "hello" },
+      sessionID: sessionId,
       delta: "hel",
     });
   });
@@ -227,7 +229,7 @@ describe("OpencodeSdkRunner activity streaming — forwarding", () => {
         properties: { sessionID: otherSession, status: { type: "busy" } },
       },
       {
-        type: "message.part.updated",
+        type: "session.text.delta",
         properties: {
           part: { sessionID: otherSession, type: "text", text: "other session" },
         },
@@ -256,21 +258,23 @@ describe("OpencodeSdkRunner activity streaming — forwarding", () => {
     expect(emitter.frames[0].kind).toBe("session.idle");
   });
 
-  it("extracts the session id from properties.part.sessionID for message.part.updated events", async () => {
-    const sessionId = "sess-part";
+  it("drops events whose properties carry no session id and matches V2 session-scoped events via properties.sessionID", async () => {
+    const sessionId = "sess-v2";
     const events: OpencodeEvent[] = [
       {
-        type: "message.part.updated",
-        properties: {
-          part: { sessionID: sessionId, type: "tool", tool: "bash" },
-        },
+        // server-wide events (server.connected) carry an empty data payload
+        // after parseSseFrame mapping and must never match.
+        type: "server.connected",
+        properties: {},
       },
       {
-        type: "message.part.removed",
-        properties: {
-          part: { sessionID: "wrong", type: "text" },
-          sessionID: sessionId,
-        },
+        type: "session.tool.called",
+        properties: { sessionID: sessionId, input: { command: "ls" } },
+      },
+      {
+        // a subagent/fork session on the same server must not leak through.
+        type: "session.text.delta",
+        properties: { sessionID: "other-session" },
       },
     ];
 
@@ -287,10 +291,9 @@ describe("OpencodeSdkRunner activity streaming — forwarding", () => {
     client.release();
     await runPromise;
 
-    // First event matches via part.sessionID; second does NOT match because
-    // message.part.removed reads part.sessionID ("wrong"), not properties.sessionID.
     expect(emitter.frames).toHaveLength(1);
-    expect(emitter.frames[0].kind).toBe("message.part.updated");
+    expect(emitter.frames[0].kind).toBe("session.tool.called");
+    expect(emitter.frames[0].sessionId).toBe(sessionId);
   });
 });
 
@@ -365,9 +368,10 @@ class DelayedRecoveryPromptClient implements OpencodePromptClient {
     public readonly eventSubscription: OpencodeEventSubscription,
     private readonly recoverAfterMs: number,
   ) {}
-  public async createSession(): Promise<string> {
+  public async createSession(_directory: string, _options: OpencodeRunnerOptions): Promise<string> {
     return this.sessionId;
   }
+  public async interrupt(_sessionId: string): Promise<void> {}
   public async subscribeEvents(_directory: string): Promise<OpencodeEventSubscription> {
     this.subscribeCalls += 1;
     return this.eventSubscription;
@@ -399,7 +403,7 @@ class DelayedRecoveryPromptClient implements OpencodePromptClient {
 
 class StreamingClientFactory2 implements OpencodeClientFactory {
   public constructor(private readonly client: OpencodePromptClient) {}
-  public async create(): Promise<OpencodePromptClient> {
+  public async create(_baseUrl: string, _auth: { password: string }): Promise<OpencodePromptClient> {
     return this.client;
   }
 }
@@ -449,7 +453,7 @@ describe("OpencodeSdkRunner stall watchdog integration", () => {
     const spawner = new FakeSpawner(handle);
     // a tool was called and is "running" (never completes); no other events
     const subscription = new ProgrammableEventSubscription([
-      { type: "session.next.tool.called", properties: { sessionID: "sess-tool" } },
+      { type: "session.tool.called", properties: { sessionID: "sess-tool" } },
     ]);
     // would succeed on attempt 2, but the tool stall must abort attempt 1 first
     const client = new DelayedRecoveryPromptClient("sess-tool", subscription, 10_000);

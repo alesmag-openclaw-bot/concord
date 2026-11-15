@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { createServer } from "net";
 import path from "path";
 
-import { OpencodeSdkRunner, ChildProcessOpencodeSpawner, HealthProbeRecorder, probeHealth, buildPromptBody, extractStructuredOutput, isRetryablePromptFailure, retryDelayMs } from "../src/infra/adapters/opencode/opencode-sdk-runner";
+import { OpencodeSdkRunner, ChildProcessOpencodeSpawner, HealthProbeRecorder, probeHealth, buildSessionCreateBody, withStructuredOutputInstruction, extractStructuredOutput, extractPromptResult, extractJsonFromText, parseSseFrame, isRetryablePromptFailure, retryDelayMs } from "../src/infra/adapters/opencode/opencode-sdk-runner";
 import { noopLogger } from "../src/domain/ports/out/logger";
 import type {
   OpencodeServerSpawner,
@@ -13,6 +13,7 @@ import type {
   OpencodePromptClient,
   OpencodeEvent,
   OpencodeEventSubscription,
+  OpencodeServerAuth,
 } from "../src/infra/adapters/opencode/opencode-sdk-runner";
 import type { BinaryResolver } from "../src/infra/adapters/system/binary-resolver";
 import type { OpencodeRunnerOptions } from "../src/domain/ports/out/opencode-runner";
@@ -53,13 +54,19 @@ interface RecordedSend {
 
 class FakePromptClient implements OpencodePromptClient {
   public readonly calls: RecordedSend[] = [];
+  public readonly sessions: Array<{ directory: string; options: OpencodeRunnerOptions }> = [];
+  public readonly interrupts: string[] = [];
   public constructor(private readonly output: unknown) {}
-  public async createSession(): Promise<string> {
+  public async createSession(directory: string, options: OpencodeRunnerOptions): Promise<string> {
+    this.sessions.push({ directory, options });
     return "session-fake";
   }
   public async prompt(sessionId: string, prompt: string, options: OpencodeRunnerOptions, schema?: object, signal?: AbortSignal): Promise<unknown> {
     this.calls.push({ sessionId, prompt, options, schema, signal });
     return this.output;
+  }
+  public async interrupt(sessionId: string): Promise<void> {
+    this.interrupts.push(sessionId);
   }
   public async subscribeEvents(_directory: string): Promise<OpencodeEventSubscription> {
     return noOpEventSubscription();
@@ -75,10 +82,10 @@ function noOpEventSubscription(): OpencodeEventSubscription {
 }
 
 class FakeClientFactory implements OpencodeClientFactory {
-  public readonly creates: Array<{ baseUrl: string }> = [];
+  public readonly creates: Array<{ baseUrl: string; auth: OpencodeServerAuth }> = [];
   public constructor(private readonly client: FakePromptClient) {}
-  public async create(baseUrl: string): Promise<OpencodePromptClient> {
-    this.creates.push({ baseUrl });
+  public async create(baseUrl: string, auth: OpencodeServerAuth): Promise<OpencodePromptClient> {
+    this.creates.push({ baseUrl, auth });
     return this.client;
   }
 }
@@ -96,7 +103,16 @@ describe("OpencodeSdkRunner.run", () => {
     expect(spawner.spawns).toHaveLength(1);
     expect(spawner.spawns[0].cwd).toBe("/worktrees/feature-x");
     expect(spawner.spawns[0].port).toBe(44000);
-    expect(factory.creates).toEqual([{ baseUrl: "http://127.0.0.1:44000" }]);
+    expect(factory.creates.map((entry) => entry.baseUrl)).toEqual(["http://127.0.0.1:44000"]);
+    // The client authenticates with the same per-run password pinned on the
+    // spawned server via OPENCODE_PASSWORD (OpenCode 2.x requires HTTP Basic
+    // auth on every API route).
+    expect(factory.creates[0]!.auth.password).toBe(spawner.spawns[0].env!.OPENCODE_PASSWORD);
+    // Agent and model travel to session creation in 2.x; the runner passes the
+    // spawn directory so the session is created at the worktree location.
+    expect(client.sessions).toEqual([
+      { directory: "/worktrees/feature-x", options: { agentId: "codex", modelId: "anthropic/claude-sonnet-4.5", runId: "run-1", consumerId: "c-1", maxInputRounds: 0 } },
+    ]);
     expect(client.calls).toHaveLength(1);
     expect(client.calls[0].prompt).toBe("fix the bug");
     expect(client.calls[0].options).toEqual({ agentId: "codex", modelId: "anthropic/claude-sonnet-4.5", runId: "run-1", consumerId: "c-1", maxInputRounds: 0 });
@@ -235,7 +251,7 @@ describe("OpencodeSdkRunner githubToken transport", () => {
     // permission pre-approval inline config is always injected (see below).
     expect(env).toBeDefined();
     expect(env!.GIT_CONFIG_COUNT).toBeUndefined();
-    expect(JSON.parse(env!.OPENCODE_CONFIG_CONTENT).permission).toBe("allow");
+    expect(JSON.parse(env!.OPENCODE_CONFIG_CONTENT).permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }]);
   });
 
   it("passes no GIT_CONFIG overlay when githubToken is empty", async () => {
@@ -250,7 +266,7 @@ describe("OpencodeSdkRunner githubToken transport", () => {
     const env = spawner.spawns[0].env;
     expect(env).toBeDefined();
     expect(env!.GIT_CONFIG_COUNT).toBeUndefined();
-    expect(JSON.parse(env!.OPENCODE_CONFIG_CONTENT).permission).toBe("allow");
+    expect(JSON.parse(env!.OPENCODE_CONFIG_CONTENT).permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }]);
   });
 });
 
@@ -274,16 +290,17 @@ describe("OpencodeSdkRunner permission pre-approval", () => {
     const env = spawner.spawns[0].env;
     expect(env).toBeDefined();
     const config = JSON.parse(env!.OPENCODE_CONFIG_CONTENT);
-    expect(config.permission).toBe("allow");
+    expect(config.permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }]);
   });
 });
 
 describe("OpencodeSdkRunner abort handling", () => {
   class AbortAwarePromptClient implements OpencodePromptClient {
     public readonly calls: RecordedSend[] = [];
-    public async createSession(): Promise<string> {
+    public async createSession(_directory: string, _options: OpencodeRunnerOptions): Promise<string> {
       return "session-fake";
     }
+    public async interrupt(_sessionId: string): Promise<void> {}
     public async prompt(sessionId: string, prompt: string, options: OpencodeRunnerOptions, schema?: object, signal?: AbortSignal): Promise<unknown> {
       this.calls.push({ sessionId, prompt, options, schema, signal });
       return new Promise<unknown>((resolve, reject) => {
@@ -421,9 +438,10 @@ describe("OpencodeSdkRunner mid-session failure diagnostics", () => {
 class ScriptedPromptClient implements OpencodePromptClient {
   public readonly calls: RecordedSend[] = [];
   public constructor(private readonly script: Array<unknown | Error>) {}
-  public async createSession(): Promise<string> {
+  public async createSession(_directory: string, _options: OpencodeRunnerOptions): Promise<string> {
     return "session-fake";
   }
+  public async interrupt(_sessionId: string): Promise<void> {}
   public async prompt(sessionId: string, prompt: string, options: OpencodeRunnerOptions, schema?: object, signal?: AbortSignal): Promise<unknown> {
     this.calls.push({ sessionId, prompt, options, schema, signal });
     const index = this.calls.length - 1;
@@ -524,13 +542,13 @@ describe("OpencodeSdkRunner prompt retry", () => {
     }
   });
 
-  it("retries an empty model-API response (returned no message) and succeeds", async () => {
+  it("retries an empty model-API response (no assistant message) and succeeds", async () => {
     vi.useFakeTimers();
     try {
       const handle = new RecordingHandle(44054);
       const spawner = new FakeSpawner(handle);
       const client = new ScriptedPromptClient([
-        new UnexpectedStateError("Opencode session.prompt returned no message (HTTP 502): no error body"),
+        new UnexpectedStateError("opencode produced no assistant message for the prompt"),
         "ok",
       ]);
       const factory = new FakeClientFactory(client);
@@ -568,16 +586,17 @@ describe("isRetryablePromptFailure", () => {
     expect(isRetryablePromptFailure(cause, undefined)).toBe(true);
   });
 
-  it("retries empty opencode responses only when there is no error body (transient model-API swallow)", () => {
-    // no payload AND no error body -> the model-API blip opencode swallowed -> retry
-    expect(isRetryablePromptFailure(new UnexpectedStateError("Opencode session.prompt returned no message (HTTP 502): no error body"), undefined)).toBe(true);
-    expect(isRetryablePromptFailure(new UnexpectedStateError("Opencode session.create returned no data (HTTP 502): no error body"), undefined)).toBe(true);
+  it("retries empty model-API responses only for the no-assistant-message signature (transient model-API swallow)", () => {
+    // The session went idle without producing any assistant message -> the
+    // model-API blip opencode swallowed -> retry.
+    expect(isRetryablePromptFailure(new UnexpectedStateError("opencode produced no assistant message for the prompt"), undefined)).toBe(true);
   });
 
-  it("does not retry a deterministic opencode 5xx that carries a real error body (e.g. UnknownError)", () => {
-    // opencode itself failed (unknown agent, etc.) -> 5xx WITH a JSON body -> deterministic, must not loop
-    expect(isRetryablePromptFailure(new UnexpectedStateError('Opencode session.prompt returned no message (HTTP 500): {"name":"UnknownError","data":{"message":"Unexpected server error"}}'), undefined)).toBe(false);
-    expect(isRetryablePromptFailure(new UnexpectedStateError("Opencode session.prompt returned no message (HTTP 500)"), undefined)).toBe(false);
+  it("does not retry a deterministic opencode API error that carries a real HTTP status and body", () => {
+    // opencode itself failed (unknown agent, etc.) -> non-2xx WITH a body ->
+    // deterministic, must not loop.
+    expect(isRetryablePromptFailure(new UnexpectedStateError('opencode POST /api/session failed (HTTP 500): {"_tag":"UnknownError"}'), undefined)).toBe(false);
+    expect(isRetryablePromptFailure(new UnexpectedStateError("opencode assistant turn failed: {\"message\":\"bad schema\"}"), undefined)).toBe(false);
   });
 
   it("does not retry abort errors (DOMException)", () => {
@@ -592,7 +611,7 @@ describe("isRetryablePromptFailure", () => {
 
   it("does not retry non-transient errors or deterministic UnexpectedStateErrors", () => {
     expect(isRetryablePromptFailure(new Error("agent blew up"), undefined)).toBe(false);
-    expect(isRetryablePromptFailure(new UnexpectedStateError("Opencode produced no StructuredOutput tool call"), undefined)).toBe(false);
+    expect(isRetryablePromptFailure(new UnexpectedStateError("Opencode produced no structured output; final assistant text: ..."), undefined)).toBe(false);
   });
 });
 
@@ -639,7 +658,7 @@ describe("OpencodeSdkRunner spawn retry", () => {
 
     expect(spawner.spawns).toHaveLength(3);
     expect(spawner.spawns.map((entry) => entry.port)).toEqual([50001, 50002, 50003]);
-    expect(factory.creates).toEqual([{ baseUrl: "http://127.0.0.1:50003" }]);
+    expect(factory.creates.map((entry) => entry.baseUrl)).toEqual(["http://127.0.0.1:50003"]);
     expect(client.calls).toHaveLength(1);
     expect(spawner.lastHandle!.killed).toBe(true);
   });
@@ -769,55 +788,161 @@ describe("HealthProbeRecorder diagnostics", () => {
   });
 });
 
-describe("buildPromptBody", () => {
+describe("buildSessionCreateBody", () => {
   const baseOptions = { agentId: "verifier", modelId: "zai-coding-plan/glm-5.2", runId: "r", consumerId: "c", maxInputRounds: 0 };
 
-  it("wraps a structured schema as an opencode OutputFormat (type: json_schema), not a raw schema", () => {
-    const schema = { type: "object", properties: { verdict: { type: "string" } } };
-    const body = buildPromptBody("review", baseOptions, schema);
-    expect(body.format).toEqual({ type: "json_schema", schema });
-    // raw schema (which opencode rejects with 400 "Expected OutputFormat") must not leak through
-    expect(body.format).not.toEqual(schema);
+  it("sends the agent, the split model reference, and the worktree location", () => {
+    const body = buildSessionCreateBody("/wt/pr-1", baseOptions);
+    // OpenCode 2.x moved agent and model from the prompt body to session
+    // creation; the model reference is the 2.x Model.Ref shape ({ id, providerID }).
+    expect(body).toEqual({
+      agent: "verifier",
+      model: { providerID: "zai-coding-plan", id: "glm-5.2" },
+      location: { directory: "/wt/pr-1" },
+    });
   });
 
-  it("omits format entirely when no schema is requested", () => {
-    const body = buildPromptBody("fix it", { ...baseOptions, modelId: "" }, undefined);
-    expect(body.format).toBeUndefined();
+  it("omits the model when none is configured and keeps the location explicit", () => {
+    const body = buildSessionCreateBody("/wt/pr-2", { ...baseOptions, modelId: "" });
     expect(body.model).toBeUndefined();
     expect(body.agent).toBe("verifier");
-    expect(body.parts).toEqual([{ type: "text", text: "fix it" }]);
+    expect(body.location).toEqual({ directory: "/wt/pr-2" });
   });
+});
 
-  it("splits a provider/model id and passes it through", () => {
-    const body = buildPromptBody("x", baseOptions);
-    expect(body.model).toEqual({ providerID: "zai-coding-plan", modelID: "glm-5.2" });
+describe("withStructuredOutputInstruction", () => {
+  it("appends the JSON schema as an explicit output contract with a bare-JSON final message", () => {
+    const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+    const text = withStructuredOutputInstruction("review this PR", schema);
+    expect(text).toContain("review this PR");
+    expect(text).toContain(JSON.stringify(schema));
+    expect(text).toMatch(/FINAL message must be exactly one JSON object/);
   });
 });
 
 describe("extractStructuredOutput", () => {
-  it("returns the input of the StructuredOutput tool call from message parts", () => {
-    const parts = [
-      { type: "step-start" },
-      { type: "reasoning", text: "thinking" },
-      { type: "tool", tool: "bash", state: { status: "completed" } },
-      { type: "tool", tool: "StructuredOutput", state: { status: "completed", input: { verdict: "approved", summary: "ok" } } },
-      { type: "step-finish" },
+  // GET /api/session/{id}/message returns messages newest-first; each assistant
+  // message carries a content array of text/reasoning/tool parts.
+  const assistant = (content: unknown[], extra: object = {}): object => ({ type: "assistant", content, ...extra });
+
+  it("returns the input of a StructuredOutput tool call when one is present (V1 compatibility)", () => {
+    const messages = [
+      assistant([
+        { type: "text", text: "done" },
+        { type: "tool", name: "StructuredOutput", state: { status: "completed", input: { verdict: "approved", summary: "ok" } } },
+      ]),
+      { type: "user" },
     ];
-    expect(extractStructuredOutput(parts)).toEqual({ verdict: "approved", summary: "ok" });
+    expect(extractStructuredOutput(messages)).toEqual({ verdict: "approved", summary: "ok" });
   });
 
-  it("returns the latest StructuredOutput input when several exist (retries)", () => {
-    const parts = [
-      { type: "tool", tool: "StructuredOutput", state: { status: "completed", input: { verdict: "approved", summary: "first" } } },
-      { type: "tool", tool: "StructuredOutput", state: { status: "completed", input: { verdict: "changes_requested", summary: "second" } } },
+  it("prefers the newest StructuredOutput input when several exist (retries)", () => {
+    const messages = [
+      assistant([{ type: "tool", name: "StructuredOutput", state: { status: "completed", input: { verdict: "changes_requested", summary: "second" } } }]),
+      assistant([{ type: "tool", name: "StructuredOutput", state: { status: "completed", input: { verdict: "approved", summary: "first" } } }]),
     ];
-    expect(extractStructuredOutput(parts)).toEqual({ verdict: "changes_requested", summary: "second" });
+    expect(extractStructuredOutput(messages)).toEqual({ verdict: "changes_requested", summary: "second" });
   });
 
-  it("returns undefined when no StructuredOutput tool call is present", () => {
-    expect(extractStructuredOutput([{ type: "text", text: "no verdict here" }])).toBeUndefined();
+  it("parses the JSON object from the newest assistant text (OpenCode 2.x path)", () => {
+    const messages = [
+      assistant([{ type: "text", text: 'Analysis...\n\n{"escalated":false,"summary":"fixed the flake"}' }]),
+      assistant([{ type: "tool", name: "shell", state: { status: "completed", input: { command: "npm test" } } }]),
+    ];
+    expect(extractStructuredOutput(messages)).toEqual({ escalated: false, summary: "fixed the flake" });
+  });
+
+  it("recovers JSON wrapped in a markdown fence or trailing prose", () => {
+    const fenced = assistant([{ type: "text", text: "Here is my verdict:\n```json\n{\"verdict\":\"approved\"}\n```\nthanks" }]);
+    expect(extractStructuredOutput([fenced])).toEqual({ verdict: "approved" });
+    const trailing = assistant([{ type: "text", text: '{"verdict":"approved"}\nDone.' }]);
+    expect(extractStructuredOutput([trailing])).toEqual({ verdict: "approved" });
+  });
+
+  it("returns undefined when no assistant message yields JSON", () => {
+    expect(extractStructuredOutput([assistant([{ type: "text", text: "no verdict here" }])])).toBeUndefined();
     expect(extractStructuredOutput(undefined)).toBeUndefined();
     expect(extractStructuredOutput([])).toBeUndefined();
+    expect(extractStructuredOutput([{ type: "user" }])).toBeUndefined();
+  });
+});
+
+describe("extractJsonFromText", () => {
+  it("parses whole-text JSON, fenced JSON, outermost braces, and last-line JSON", () => {
+    expect(extractJsonFromText('{"a":1}')).toEqual({ a: 1 });
+    expect(extractJsonFromText("prose\n```json\n{\"a\":2}\n```")).toEqual({ a: 2 });
+    expect(extractJsonFromText('The verdict is {"a":3} as requested')).toEqual({ a: 3 });
+    expect(extractJsonFromText('thinking...\n{"a":4}')).toEqual({ a: 4 });
+  });
+
+  it("returns undefined for text without any JSON object", () => {
+    expect(extractJsonFromText("no json at all")).toBeUndefined();
+    expect(extractJsonFromText("")).toBeUndefined();
+  });
+});
+
+describe("extractPromptResult", () => {
+  it("returns the final assistant text for unstructured prompts", () => {
+    const messages = [
+      { type: "assistant", content: [{ type: "text", text: "PR looks good" }] },
+      { type: "user" },
+    ];
+    expect(extractPromptResult(messages, false)).toBe("PR looks good");
+  });
+
+  it("returns the parsed structured output for structured prompts", () => {
+    const messages = [
+      { type: "assistant", content: [{ type: "text", text: '{"verdict":"approved"}' }] },
+      { type: "assistant", content: [{ type: "tool", name: "shell", state: { status: "completed", input: {} } }] },
+    ];
+    expect(extractPromptResult(messages, true)).toEqual({ verdict: "approved" });
+  });
+
+  it("throws (retryable empty-turn signature) when no assistant message exists", () => {
+    expect(() => extractPromptResult([{ type: "user" }], false)).toThrow(/produced no assistant message/);
+  });
+
+  it("throws deterministically when the final assistant turn errored", () => {
+    const errored = [
+      { type: "assistant", content: [], finish: "error", error: { message: "provider unavailable" } },
+    ];
+    expect(() => extractPromptResult(errored, false)).toThrow(/provider unavailable/);
+    const finishOnly = [
+      { type: "assistant", content: [], finish: "error" },
+    ];
+    expect(() => extractPromptResult(finishOnly, false)).toThrow(/finish: error/);
+  });
+
+  it("throws with the final text attached when structured output is missing", () => {
+    const messages = [
+      { type: "assistant", content: [{ type: "text", text: "I could not produce JSON" }] },
+    ];
+    expect(() => extractPromptResult(messages, true)).toThrow(/no structured output.*I could not produce JSON/);
+  });
+});
+
+describe("parseSseFrame", () => {
+  it("maps a 2.x event envelope onto { type, properties }", () => {
+    const frame = JSON.stringify({
+      id: "evt_1",
+      type: "session.tool.called",
+      location: { directory: "/wt" },
+      data: { sessionID: "ses_1", input: { command: "ls" } },
+    });
+    expect(parseSseFrame(frame)).toEqual({
+      type: "session.tool.called",
+      properties: { sessionID: "ses_1", input: { command: "ls" } },
+    });
+  });
+
+  it("returns undefined for heartbeats, non-JSON, and frames without a type", () => {
+    expect(parseSseFrame("heartbeat")).toBeUndefined();
+    expect(parseSseFrame("{not json")).toBeUndefined();
+    expect(parseSseFrame('{"data":{}}')).toBeUndefined();
+  });
+
+  it("defaults properties to an empty record when the envelope has no data", () => {
+    expect(parseSseFrame('{"type":"server.connected"}')).toEqual({ type: "server.connected", properties: {} });
   });
 });
 
@@ -901,15 +1026,19 @@ describe("OpencodeSdkRunner run-input MCP wiring", () => {
     const configContent = env!.OPENCODE_CONFIG_CONTENT;
     expect(configContent).toBeDefined();
     const config = JSON.parse(configContent);
-    expect(config.permission).toBe("allow");
-    expect(config.mcp["concord-run-tools"].type).toBe("remote");
-    expect(config.mcp["concord-run-tools"].url).toBe(`http://127.0.0.1:${backendFactory.requestedPorts[0]}/mcp`);
-    expect(config.mcp["concord-run-tools"].enabled).toBe(true);
+    expect(config.permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }]);
+    // OpenCode 2.x groups servers under mcp.servers, replaces `enabled` with
+    // the inverse `disabled`, splits the V1 scalar timeout into purposes, and
+    // defaults remote servers to OAuth — which the concord tools endpoint does
+    // not speak, hence the explicit oauth:false.
+    expect(config.mcp.servers["concord-run-tools"].type).toBe("remote");
+    expect(config.mcp.servers["concord-run-tools"].url).toBe(`http://127.0.0.1:${backendFactory.requestedPorts[0]}/mcp`);
+    expect(config.mcp.servers["concord-run-tools"].oauth).toBe(false);
     // The ask_question tool blocks for up to a full day waiting for a human.
-    // The per-server timeout must be sized to that worst case (24h + buffer) so
-    // opencode's ~60s default never aborts the call mid-wait.
-    expect(config.mcp["concord-run-tools"].timeout).toBeGreaterThan(60 * 60 * 1000);
-    expect(config.mcp["concord-input"]).toBeUndefined();
+    // The execution timeout must be sized to that worst case (24h + buffer) so
+    // opencode's default never aborts the call mid-wait.
+    expect(config.mcp.servers["concord-run-tools"].timeout.execution).toBeGreaterThan(60 * 60 * 1000);
+    expect(config.mcp.servers["concord-input"]).toBeUndefined();
   });
 
   it("registers post_update but not ask_question when maxInputRounds is 0", async () => {
@@ -956,7 +1085,7 @@ describe("OpencodeSdkRunner run-input MCP wiring", () => {
     const config = JSON.parse(env!.OPENCODE_CONFIG_CONTENT);
     // No MCP server is registered without wiring, but permissions are still
     // pre-approved so the run is never gated on a permission prompt.
-    expect(config.permission).toBe("allow");
+    expect(config.permissions).toEqual([{ action: "*", resource: "*", effect: "allow" }]);
     expect(config.mcp).toBeUndefined();
   });
 
@@ -1042,9 +1171,13 @@ describe("probeHealth", () => {
 // resolves immediately with a scripted value.
 class AbortAwarePromptClient implements OpencodePromptClient {
   public readonly calls: AbortSignal[] = [];
+  public readonly interrupts: string[] = [];
   public constructor(private readonly script: Array<{ hang: true } | { value: unknown }>) {}
-  public async createSession(): Promise<string> {
+  public async createSession(_directory: string, _options: OpencodeRunnerOptions): Promise<string> {
     return "session-fake";
+  }
+  public async interrupt(sessionId: string): Promise<void> {
+    this.interrupts.push(sessionId);
   }
   public async prompt(
     _sessionId: string,
@@ -1097,6 +1230,9 @@ describe("OpencodeSdkRunner model-stall retry", () => {
       await vi.advanceTimersByTimeAsync(15_000);
       await vi.advanceTimersByTimeAsync(0);
       expect(client.calls).toHaveLength(2);
+      // The stall abort must interrupt the wedged server-side generation so
+      // the re-sent prompt is not queued behind a stream that never completes.
+      expect(client.interrupts).toEqual(["session-fake"]);
 
       await expect(promise).resolves.toBeUndefined();
       expect(handle.killed).toBe(true);

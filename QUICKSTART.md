@@ -52,6 +52,10 @@ extra noun/verb handlers through the exported `runCli` runner.
 - Node.js 20+ (for `fs.cp`, `fetch`, and `WebSocket` globals)
 - `npm` (workspaces are used)
 - `git` (for the GitHub PR producer and the worktree-based agent runners)
+- OpenCode **2.x** on PATH (`opencode --version` must report 2.x). The agent
+  runner drives the 2.x HTTP API (`/api/session`, `/api/session/{id}/prompt`,
+  `/api/event`); OpenCode 1.x is not supported. Install or update with
+  `curl -fsSL https://opencode.ai/install | bash`.
 - The `gh` CLI, logged in (`gh auth login`), used by `GhCliCredentialsProvider`
   to obtain a GitHub token for the PR producer. Run `gh auth status` to verify.
 - [opencode](https://opencode.ai) on `PATH`, with a model provider configured,

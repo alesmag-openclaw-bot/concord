@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "child_process";
 import { createServer } from "net";
+import { randomBytes } from "node:crypto";
 import { stat } from "node:fs/promises";
-import type { OpencodeClient } from "@opencode-ai/sdk";
 
 import type { Logger } from "../../../domain/ports/out/logger";
 import { noopLogger } from "../../../domain/ports/out/logger";
@@ -79,8 +79,11 @@ export interface OpencodeServerSpawner {
 }
 
 export interface OpencodePromptClient {
-  createSession(): Promise<string>;
+  createSession(directory: string, options: OpencodeRunnerOptions): Promise<string>;
   prompt(sessionId: string, promptText: string, options: OpencodeRunnerOptions, schema?: object, signal?: AbortSignal): Promise<unknown>;
+  // Best-effort stop of a session's in-flight execution (used to unblock a
+  // wedged generation before re-sending a prompt after a model-stall abort).
+  interrupt(sessionId: string): Promise<void>;
   subscribeEvents(directory: string): Promise<OpencodeEventSubscription>;
 }
 
@@ -95,7 +98,16 @@ export interface OpencodeEventSubscription {
 }
 
 export interface OpencodeClientFactory {
-  create(baseUrl: string): Promise<OpencodePromptClient>;
+  create(baseUrl: string, auth: OpencodeServerAuth): Promise<OpencodePromptClient>;
+}
+
+// OpenCode 2.x servers require HTTP Basic auth on every API route. The runner
+// owns the spawned process, so it pins the server password through the
+// OPENCODE_PASSWORD env var and hands the same secret to the client factory.
+// Without it, `opencode serve` generates a random password printed to stdout
+// that no API request could authenticate with.
+export interface OpencodeServerAuth {
+  readonly password: string;
 }
 
 async function assertSpawnDirectoryExists(directory: string): Promise<void> {
@@ -150,141 +162,83 @@ export class ChildProcessOpencodeSpawner implements OpencodeServerSpawner {
   }
 }
 
-// @opencode-ai/sdk is ESM-only while this package compiles to CommonJS, so it
-// cannot be statically required. The dynamic import is built via `new Function`
-// so the CJS compiler does not down-level it back into a require() call.
-const importSdk = new Function(
-  "specifier",
-  "return import(specifier)",
-) as (specifier: string) => Promise<typeof import("@opencode-ai/sdk")>;
-
+// undici is ESM-only while this package compiles to CommonJS, so it cannot be
+// statically required. The dynamic import is built via `new Function` so the
+// CJS compiler does not down-level it back into a require() call.
 type UndiciModule = typeof import("undici");
 const importUndici = new Function(
   "specifier",
   "return import(specifier)",
 ) as (specifier: string) => Promise<UndiciModule>;
 
-// A single blocking `session.prompt` request stays open for the entire agent
-// run, which routinely exceeds undici's default 300s headers/body timeout and
-// is aborted mid-run (UND_ERR_HEADERS_TIMEOUT, surfacing as a bare "fetch
-// failed" at ~5 minutes while the opencode process is still alive). Back the
-// SDK's fetch with an Agent that disables both timeouts; the run's AbortSignal
-// (baked into the SDK's Request) still bounds the request lifetime.
+// A single prompt→wait cycle stays open for the entire agent run, which
+// routinely exceeds undici's default 300s headers/body timeout and is aborted
+// mid-run (UND_ERR_HEADERS_TIMEOUT, surfacing as a bare "fetch failed" at ~5
+// minutes while the opencode process is still alive). Back every request with
+// an Agent from the same undici package that provides the fetch — mixing the
+// npm Agent into the *global* fetch breaks on newer Node versions (the bundled
+// undici rejects foreign dispatchers with "invalid onError method"), so both
+// come from the engine's own dependency and are version-matched by design.
+// The run's AbortSignal still bounds each request's lifetime.
 //
-// NB: we must use the *global* fetch, not undici's own. The SDK builds a global
-// Request; undici's fetch (separate class identity from Node's bundled undici)
-// cannot parse it and throws "Failed to parse URL from [object Request]". The
-// global fetch understands the global Request natively and still honors our
-// dispatcher (verified: dispatcher routing + headersTimeout are both respected).
-type LongLivedFetch = (request: Request) => Promise<Response>;
+// The structural response type keeps undici's class identities out of the
+// public surface: only the members the client reads are declared.
+type LongLivedResponse = {
+  readonly ok: boolean;
+  readonly status: number;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+  readonly body: ReadableStream<Uint8Array> | null;
+};
+
+type LongLivedRequest = {
+  readonly url: string;
+  readonly method: string;
+  readonly headers: Record<string, string>;
+  readonly body: string | undefined;
+  readonly signal: AbortSignal | undefined;
+};
+
+type LongLivedFetch = (request: LongLivedRequest) => Promise<LongLivedResponse>;
+
 function createLongLivedFetch(): Promise<LongLivedFetch> {
   return importUndici("undici").then((undici) => {
     const dispatcher = new undici.Agent({ headersTimeout: 0, bodyTimeout: 0 });
-    return (request: Request) => globalThis.fetch(request, { dispatcher });
+    return (request) =>
+      undici.fetch(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        signal: request.signal,
+        dispatcher,
+      }) as Promise<LongLivedResponse>;
   });
 }
 
-// The SDK returns { data, error, response } at runtime, but the opencode
-// wrapper's generated method types only expose { data }. Widen locally so we
-// can surface the error/status when data is missing.
-type SdkResult<T> = {
-  data: T | undefined;
-  error?: unknown;
-  response?: { status?: number };
-};
+// OpenCode 2.x authenticates every API route with HTTP Basic auth; the username
+// is always "opencode" and the password is whatever OPENCODE_PASSWORD pinned on
+// the spawned server (see the migration guide's "Server authentication").
+const V2_AUTH_USERNAME = "opencode";
 
-export class SdkOpencodeClientFactory implements OpencodeClientFactory {
+// Reconnect cadence for the SSE event subscription after a dropped connection.
+// The V2 event stream is live-only with no replay: reconnect promptly so the
+// stall watchdog and the UI activity stream keep working through undici's idle
+// disconnects, while backing off so a dead server is not hammered.
+const SSE_RECONNECT_INITIAL_DELAY_MS = 1_000;
+const SSE_RECONNECT_MAX_DELAY_MS = 30_000;
+
+export class HttpApiV2OpencodeClientFactory implements OpencodeClientFactory {
   private fetchPromise: Promise<LongLivedFetch> | null = null;
 
-  public async create(baseUrl: string): Promise<OpencodePromptClient> {
-    const sdk = await importSdk("@opencode-ai/sdk");
-    // The opencode wrapper's generated types only expose baseUrl/directory,
-    // but the underlying hey-api client resolves `_config.fetch` per request.
-    // Inject our timeout-free fetch at the client config so every request
-    // (session.create, session.prompt) inherits it.
-    type OpencodeClientConfig = Parameters<typeof sdk.createOpencodeClient>[0] & { fetch?: LongLivedFetch };
-    const client: OpencodeClient = sdk.createOpencodeClient({
-      baseUrl,
-      fetch: await this.longLivedFetch(),
-    } as OpencodeClientConfig);
+  public async create(baseUrl: string, auth: OpencodeServerAuth): Promise<OpencodePromptClient> {
+    const fetchFn = await this.longLivedFetch();
+    const authorization = `Basic ${Buffer.from(`${V2_AUTH_USERNAME}:${auth.password}`, "utf8").toString("base64")}`;
+    const api = new V2HttpApi(baseUrl, authorization, fetchFn);
     return {
-      async createSession(): Promise<string> {
-        const created: SdkResult<{ id: string }> = await client.session.create({ body: {} });
-        const session = created.data;
-        if (session === undefined) {
-          throw new UnexpectedStateError(`Opencode session.create returned no data (HTTP ${created.response?.status ?? "?"}): ${describeSdkError(created.error)}`);
-        }
-        return session.id;
-      },
-      async prompt(sessionId: string, promptText: string, options: OpencodeRunnerOptions, schema?: object, signal?: AbortSignal): Promise<unknown> {
-        const body = buildPromptBody(promptText, options, schema);
-        const response: SdkResult<unknown> = await client.session.prompt({
-          path: { id: sessionId },
-          body,
-          signal,
-        });
-        const message = response.data;
-        if (message === undefined) {
-          throw new UnexpectedStateError(`Opencode session.prompt returned no message (HTTP ${response.response?.status ?? "?"}): ${describeSdkError(response.error)}`);
-        }
-        // Structured path: opencode delivers the object as the input of a
-        // `StructuredOutput` tool call in the message parts, not as the prompt's
-        // data. Extract and return it so callers get the parsed object.
-        if (schema !== undefined) {
-          const parts = (message as { parts?: unknown }).parts;
-          const output = extractStructuredOutput(parts);
-          if (output === undefined) {
-            const partCount = Array.isArray(parts) ? parts.length : 0;
-            throw new UnexpectedStateError(`Opencode produced no StructuredOutput tool call (HTTP ${response.response?.status ?? "?"}, ${partCount} parts): ${describeSdkError(response.error)}`);
-          }
-          return output;
-        }
-        return message;
-      },
-      async subscribeEvents(directory: string): Promise<OpencodeEventSubscription> {
-        const controller = new AbortController();
-        // The generated OpencodeClient type does not expose the `event` accessor
-        // across all TypeScript module resolutions, but the runtime object does
-        // (see the SDK's sdk.gen.js). Widen locally so we can call subscribe.
-        type EventSubscribeOptions = {
-          query?: { directory?: string };
-          signal?: AbortSignal;
-          sseMaxRetryAttempts?: number;
-          sseSleepFn?: (ms: number) => Promise<void>;
-        };
-        type EventClient = {
-          subscribe(options?: EventSubscribeOptions): Promise<{ stream: AsyncGenerator<unknown> }>;
-        };
-        const eventClient = (client as unknown as { event: EventClient }).event;
-        // The SSE client resolves its fetch from the global, not the per-client
-        // timeout-free dispatcher (see createSseClient source). undici's default
-        // 300s body/headers timeout therefore applies and fires during long idle
-        // periods in an agent turn. Configure the SSE retry to reconnect
-        // transparently on such a timeout, and provide a sleep function that
-        // resolves instantly when our close() aborts so teardown is immediate.
-        const result = await eventClient.subscribe({
-          query: { directory },
-          signal: controller.signal,
-          sseMaxRetryAttempts: Number.MAX_SAFE_INTEGER,
-          sseSleepFn: (ms: number): Promise<void> => new Promise((resolve) => {
-            if (controller.signal.aborted) {
-              resolve();
-              return;
-            }
-            const timer = setTimeout(resolve, ms);
-            controller.signal.addEventListener("abort", () => {
-              clearTimeout(timer);
-              resolve();
-            }, { once: true });
-          }),
-        });
-        return {
-          events: result.stream as AsyncGenerator<OpencodeEvent>,
-          close: () => {
-            controller.abort();
-          },
-        };
-      },
+      createSession: (directory, options) => api.createSession(directory, options),
+      prompt: (sessionId, promptText, options, schema, signal) => api.prompt(sessionId, promptText, schema, signal),
+      interrupt: (sessionId) => api.interrupt(sessionId),
+      subscribeEvents: (directory) => api.subscribeEvents(directory),
     };
   }
 
@@ -293,6 +247,201 @@ export class SdkOpencodeClientFactory implements OpencodeClientFactory {
       this.fetchPromise = createLongLivedFetch();
     }
     return this.fetchPromise;
+  }
+}
+
+// Thin client for the OpenCode 2.x HTTP API
+// (https://opencode.ai/docs/api). The endpoints the runner drives:
+//   POST /api/session                                   — create (agent + model + location)
+//   POST /api/session/{id}/prompt                       — enqueue the user message
+//   POST /api/experimental/session/{id}/wait            — block until the session is idle
+//   GET  /api/session/{id}/message                      — newest-first message list
+//   POST /api/session/{id}/interrupt                    — stop in-flight execution
+//   GET  /api/event                                     — SSE event stream
+// The V1 SDK (and its blocking session.prompt + native json_schema OutputFormat)
+// no longer exists in 2.x: agent and model move to session creation, the prompt
+// body is plain text, and structured output is requested through the prompt
+// text and parsed from the final assistant message.
+class V2HttpApi {
+  public constructor(
+    private readonly baseUrl: string,
+    private readonly authorization: string,
+    private readonly fetchFn: LongLivedFetch,
+  ) {}
+
+  public async createSession(directory: string, options: OpencodeRunnerOptions): Promise<string> {
+    const body = buildSessionCreateBody(directory, options);
+    const payload = await this.request("POST", "/api/session", body, undefined);
+    const data = (payload as { data?: { id?: unknown } }).data;
+    if (typeof data?.id !== "string" || data.id.length === 0) {
+      throw new UnexpectedStateError(`Opencode POST /api/session returned no session id: ${describeJson(payload)}`);
+    }
+    return data.id;
+  }
+
+  public async prompt(
+    sessionId: string,
+    promptText: string,
+    schema: object | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<unknown> {
+    // OpenCode 2.x has no native structured output: the schema travels as an
+    // explicit output contract in the prompt text and the JSON object is
+    // parsed out of the final assistant message (see extractStructuredOutput).
+    const text = schema === undefined ? promptText : withStructuredOutputInstruction(promptText, schema);
+    await this.request("POST", `/api/session/${sessionId}/prompt`, { text }, signal);
+    await this.request("POST", `/api/experimental/session/${sessionId}/wait`, undefined, signal);
+    const payload = await this.request("GET", `/api/session/${sessionId}/message`, undefined, signal);
+    return extractPromptResult((payload as { data?: unknown }).data, schema !== undefined);
+  }
+
+  public async interrupt(sessionId: string): Promise<void> {
+    await this.request("POST", `/api/session/${sessionId}/interrupt`, undefined, undefined);
+  }
+
+  public async subscribeEvents(directory: string): Promise<OpencodeEventSubscription> {
+    const controller = new AbortController();
+    const api = this;
+    async function* stream(): AsyncGenerator<OpencodeEvent> {
+      let reconnectDelayMs = SSE_RECONNECT_INITIAL_DELAY_MS;
+      while (!controller.signal.aborted) {
+        let connected = false;
+        try {
+          const response = await api.fetchFn({
+            url: `${api.baseUrl}/api/event`,
+            method: "GET",
+            headers: { authorization: api.authorization, accept: "text/event-stream" },
+            body: undefined,
+            signal: controller.signal,
+          });
+          if (!response.ok || response.body === null) {
+            throw new UnexpectedStateError(`event stream HTTP ${response.status}`);
+          }
+          connected = true;
+          for await (const frame of readSseFrames(response.body)) {
+            const event = parseSseFrame(frame);
+            if (event !== undefined) {
+              yield event;
+            }
+          }
+        } catch {
+          // A dropped or failed stream reconnects below unless close() raced it.
+        }
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (connected) {
+          reconnectDelayMs = SSE_RECONNECT_INITIAL_DELAY_MS;
+        }
+        await abortableDelay(reconnectDelayMs, controller.signal);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, SSE_RECONNECT_MAX_DELAY_MS);
+      }
+    }
+    return {
+      events: stream(),
+      close: () => {
+        controller.abort();
+      },
+    };
+  }
+
+  private async request(method: string, path: string, body: object | undefined, signal: AbortSignal | undefined): Promise<unknown> {
+    const response = await this.fetchFn({
+      url: `${this.baseUrl}${path}`,
+      method,
+      headers: {
+        authorization: this.authorization,
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    });
+    if (!response.ok) {
+      throw new UnexpectedStateError(`opencode ${method} ${path} failed (HTTP ${response.status}): ${await describeResponseBody(response)}`);
+    }
+    if (response.status === 204) {
+      return {};
+    }
+    return await response.json();
+  }
+}
+
+// Reads a text/event-stream body and yields each complete frame's data lines
+// joined with "\n" (per the SSE spec). Comment lines (": heartbeat") produce
+// no frame. Splitting on line boundaries handles chunk boundaries of any size.
+async function* readSseFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines: string[] = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line.length === 0) {
+          if (dataLines.length > 0) {
+            yield dataLines.join("\n");
+            dataLines = [];
+          }
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice("data:".length).replace(/^ /, ""));
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+    if (dataLines.length > 0) {
+      yield dataLines.join("\n");
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// Each SSE frame carries one JSON-encoded event:
+//   {"id":"evt_...","type":"session.tool.called","location":{...},"data":{...}}
+// Map it onto the runner's OpencodeEvent shape: type from the envelope,
+// properties from the nested data object.
+export function parseSseFrame(frame: string): OpencodeEvent | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(frame);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+  const candidate = parsed as { type?: unknown; data?: unknown };
+  if (typeof candidate.type !== "string") {
+    return undefined;
+  }
+  const properties = candidate.data;
+  return {
+    type: candidate.type,
+    properties: typeof properties === "object" && properties !== null ? (properties as Record<string, unknown>) : {},
+  };
+}
+
+async function describeResponseBody(response: LongLivedResponse): Promise<string> {
+  try {
+    return (await response.text()).trim().slice(0, 500);
+  } catch {
+    return "no error body";
+  }
+}
+
+function describeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value).slice(0, 500);
+  } catch {
+    return String(value);
   }
 }
 
@@ -366,7 +515,7 @@ export class OpencodeSdkRunner implements OpencodeRunner {
 
   public constructor(
     spawner?: OpencodeServerSpawner,
-    private readonly clientFactory: OpencodeClientFactory = new SdkOpencodeClientFactory(),
+    private readonly clientFactory: OpencodeClientFactory = new HttpApiV2OpencodeClientFactory(),
     private readonly portAllocator: PortAllocator = freePort,
     private readonly runInput: OpencodeRunInputWiring | null = null,
     private readonly logger: Logger = noopLogger,
@@ -422,7 +571,13 @@ export class OpencodeSdkRunner implements OpencodeRunner {
       };
     }
 
-    const env = buildSpawnEnv(options.githubToken, toolsServer, MCP_TOOLS_TIMEOUT_MS);
+    // OpenCode 2.x requires HTTP Basic auth on the API. The runner pins a
+    // per-run random password on the spawned server (OPENCODE_PASSWORD) and
+    // authenticates the API client with the same secret. The server listens on
+    // 127.0.0.1 only and dies with the run, so the secret's lifetime is the
+    // run itself.
+    const auth: OpencodeServerAuth = { password: randomBytes(24).toString("hex") };
+    const env = buildSpawnEnv(options.githubToken, toolsServer, MCP_TOOLS_TIMEOUT_MS, auth.password);
     let server: OpencodeServerHandle;
     try {
       server = await this.spawnHealthyServer(directory, env);
@@ -454,8 +609,8 @@ export class OpencodeSdkRunner implements OpencodeRunner {
     );
     try {
       const baseUrl = `http://${HOST}:${server.port}`;
-      const client = await this.clientFactory.create(baseUrl);
-      const sessionId = await client.createSession();
+      const client = await this.clientFactory.create(baseUrl, auth);
+      const sessionId = await client.createSession(directory, options);
 
       // Now that the session id is known, register the per-run tools on the
       // shared backend. post_update is always available; ask_question is
@@ -663,12 +818,26 @@ export class OpencodeSdkRunner implements OpencodeRunner {
             throw enrichPromptFailure(abortedReason, server, this.logger);
           }
           modelStallRetries = modelStallRetries + 1;
-          this.logger.warn("opencode-runner", "model stall detected, re-sending prompt", {
+          this.logger.warn("opencode-runner", "model stall detected, interrupting session and re-sending prompt", {
             modelStallRetry: modelStallRetries,
             maxModelStallRetries: this.maxModelStallRetries,
             delayMs: MODEL_STALL_RETRY_DELAY_MS,
             error: abortedReason.message,
           });
+          // Aborting the wait request does NOT stop the server-side
+          // generation (unlike V1's blocking prompt request). Interrupt the
+          // session so the wedged generation stops and the re-sent prompt is
+          // not queued behind a stream that will never complete. Best-effort:
+          // an interrupt failure must not mask the stall retry.
+          try {
+            await client.interrupt(sessionId);
+          } catch (interruptCause) {
+            this.logger.warn("opencode-runner", "session interrupt failed after model stall", {
+              runId: options.runId,
+              consumerId: options.consumerId,
+              error: describeCause(interruptCause),
+            });
+          }
           await abortableDelay(MODEL_STALL_RETRY_DELAY_MS, signal);
           continue;
         }
@@ -732,59 +901,75 @@ function githubTokenEnvOverlay(githubToken: string | undefined): Record<string, 
 // The inline opencode config injected into every spawned server, serialized
 // into the OPENCODE_CONFIG_CONTENT env var. opencode merges it (precedence:
 // runtime override) with any existing project/global config, so other MCP
-// servers (e.g. tokensave) and permission rules are preserved/overridden as
-// expected. `permission` is ALWAYS set to "allow"; `mcp` is present only when a
-// per-run tools server is wired.
+// servers and permission rules are preserved/overridden as expected. The
+// permissions array ALWAYS allows every action; `mcp.servers` is present only
+// when a per-run tools server is wired. Shapes are native OpenCode 2.x (see
+// https://opencode.ai/docs/config).
 type InlineOpencodeConfig = {
-  permission: "allow";
-  mcp?: Record<string, { type: "remote"; url: string; enabled: boolean; timeout: number }>;
+  permissions: Array<{ action: string; resource: string; effect: "allow" }>;
+  mcp?: {
+    servers: Record<string, {
+      type: "remote";
+      url: string;
+      // The concord tools endpoint has no OAuth; without `oauth: false` the
+      // 2.x remote transport defaults to OAuth discovery and parks the server
+      // in "needs authentication".
+      oauth: false;
+      timeout: { execution: number };
+    }>;
+  };
 };
 
 // Builds the env overlay passed to the opencode spawn. Merges the GitHub token
-// GIT_CONFIG overlay with the OPENCODE_CONFIG_CONTENT inline config built by
-// buildInlineConfig. The overlay is always non-empty because the inline config
-// always carries the permission pre-approval, so this never returns undefined.
+// GIT_CONFIG overlay and the OPENCODE_PASSWORD server credential with the
+// OPENCODE_CONFIG_CONTENT inline config built by buildInlineConfig. The overlay
+// is always non-empty, so this never returns undefined.
 function buildSpawnEnv(
   githubToken: string | undefined,
   toolsServer: ToolsServerHandle | null,
   toolsTimeoutMs: number,
+  serverPassword: string,
 ): Record<string, string> {
   const overlay: Record<string, string> = {};
   const tokenOverlay = githubTokenEnvOverlay(githubToken);
   if (tokenOverlay !== undefined) {
     Object.assign(overlay, tokenOverlay);
   }
+  overlay.OPENCODE_PASSWORD = serverPassword;
   overlay.OPENCODE_CONFIG_CONTENT = JSON.stringify(buildInlineConfig(toolsServer, toolsTimeoutMs));
   return overlay;
 }
 
-// The inline config always pre-approves every permission category, and
+// The inline config always pre-approves every permission action, and
 // additionally registers the per-run concord-run-tools MCP server endpoint
 // (hosting post_update and, when enabled, ask_question) when a tools server is
 // present.
 //
 // Autonomous agent runs have no human at a TTY to answer opencode's permission
-// prompts. Any tool opencode classifies as needing approval — a destructive
-// bash command such as `rm`, or any path outside the project's
-// external-directory allowlist — emits `permission.asked` and then blocks
-// forever waiting for an answer that never arrives. In production this surfaced
-// as a fix run that issued `rm -f /tmp/mock-trace.log`, sat idle
-// on `permission.asked` for ~44 minutes, and was killed by the 1h per-consumer
-// hard timeout. Pre-approving removes that gate. The run's own boundaries (an
-// isolated worktree, a scoped GitHub token, and the per-consumer run timeout)
-// are the real safety fence; a permission prompt is not a meaningful guard when
-// nobody can answer it.
+// prompts. Any unresolved permission check waits for a client reply that never
+// arrives. In production (V1) this surfaced as a fix run that issued
+// `rm -f /tmp/mock-trace.log`, sat idle on permission.asked for ~44 minutes,
+// and was killed by the 1h per-consumer hard timeout. Pre-approving removes
+// that gate. The run's own boundaries (an isolated worktree, a scoped GitHub
+// token, and the per-consumer run timeout) are the real safety fence; a
+// permission prompt is not a meaningful guard when nobody can answer it.
 function buildInlineConfig(toolsServer: ToolsServerHandle | null, toolsTimeoutMs: number): InlineOpencodeConfig {
-  const config: InlineOpencodeConfig = { permission: "allow" };
+  const config: InlineOpencodeConfig = {
+    permissions: [{ action: "*", resource: "*", effect: "allow" }],
+  };
   if (toolsServer !== null) {
     config.mcp = {
-      [RUN_TOOLS_MCP_SERVER_NAME]: {
-        type: "remote",
-        url: toolsServer.endpoint,
-        enabled: true,
-        // Sized to the maximum input wait so ask_question can block for a human
-        // response without opencode's default (~60s) MCP timeout aborting it.
-        timeout: toolsTimeoutMs,
+      servers: {
+        [RUN_TOOLS_MCP_SERVER_NAME]: {
+          type: "remote",
+          url: toolsServer.endpoint,
+          oauth: false,
+          // Sized to the maximum input wait so ask_question can block for a
+          // human response without opencode's MCP execution timeout aborting
+          // it. `execution` covers tool calls (the V1 scalar `timeout` became
+          // { catalog, execution } in 2.x).
+          timeout: { execution: toolsTimeoutMs },
+        },
       },
     };
   }
@@ -807,23 +992,14 @@ async function closeToolsServer(toolsServer: ToolsServerHandle | null): Promise<
   }
 }
 
-// The OpenCode event stream is per-server (scoped to the worktree directory),
-// not per-session: a single server may host subtask or fork sessions whose
-// events the runner does not want to surface. Extract the session id from each
-// event and let the consumer filter. message.part.* events carry the session
-// id on the nested part object; all other session-scoped events carry it at
-// properties.sessionID. Events without a session id (e.g. server.connected)
-// never match and are silently dropped.
+// The OpenCode event stream is per-server (scoped to the worktree directory the
+// server was spawned in), not per-session: a single server may host subagent or
+// fork sessions whose events the runner does not want to surface. Every
+// session-scoped 2.x event carries the session id in its data payload (mapped
+// onto properties by parseSseFrame). Events without a session id (e.g.
+// server.connected) never match and are silently dropped.
 function extractSessionId(event: OpencodeEvent): string | undefined {
-  const properties = event.properties;
-  if (event.type === "message.part.updated" || event.type === "message.part.removed") {
-    const part = (properties as { part?: { sessionID?: string } }).part;
-    if (part === undefined) {
-      return undefined;
-    }
-    return part.sessionID;
-  }
-  return (properties as { sessionID?: string }).sessionID;
+  return (event.properties as { sessionID?: string }).sessionID;
 }
 
 // Agent and model are required per consumer, not optional. Without them
@@ -852,74 +1028,184 @@ function splitModelId(modelId: string): { providerID: string; modelID: string } 
   return { providerID: modelId.slice(0, slash), modelID: modelId.slice(slash + 1) };
 }
 
-export type PromptBody = {
+// OpenCode 2.x moved agent and model from the prompt body to session creation
+// (POST /api/session). The model reference uses the 2.x Model.Ref shape with
+// `id` (not the V1 SDK's `modelID`).
+export type SessionCreateBody = {
   agent: string;
-  parts: Array<{ type: "text"; text: string }>;
-  model?: { providerID: string; modelID: string };
-  // opencode's session.prompt `format` is an OutputFormat, NOT a raw JSON
-  // schema. Passing a bare schema is rejected with HTTP 400
-  // "Expected OutputFormat, got {...} at [format]" (which broke structured
-  // every structured-output consumer). Wrap it as { type: "json_schema", schema }.
-  format?: { type: "json_schema"; schema: object };
+  model?: { providerID: string; id: string };
+  location: { directory: string };
 };
 
-export function buildPromptBody(prompt: string, options: OpencodeRunnerOptions, schema?: object): PromptBody {
-  const body: PromptBody = {
+export function buildSessionCreateBody(directory: string, options: OpencodeRunnerOptions): SessionCreateBody {
+  const body: SessionCreateBody = {
     agent: options.agentId,
-    parts: [{ type: "text", text: prompt }],
+    location: { directory },
   };
   if (options.modelId.length > 0) {
-    body.model = splitModelId(options.modelId);
-  }
-  if (schema !== undefined) {
-    body.format = { type: "json_schema", schema };
+    const { providerID, modelID } = splitModelId(options.modelId);
+    body.model = { providerID, id: modelID };
   }
   return body;
 }
 
-type StructuredOutputPart = {
-  type: "tool";
-  tool: "StructuredOutput";
-  state?: { status?: string; input?: unknown };
+// OpenCode 2.x has no native structured output (the V1 prompt `format` field
+// and the StructuredOutput tool call no longer exist). The schema travels as an
+// explicit output contract appended to the prompt, and the final assistant
+// message is parsed for the JSON object (see extractStructuredOutput).
+export function withStructuredOutputInstruction(prompt: string, schema: object): string {
+  return [
+    prompt,
+    "",
+    "## Required output format",
+    "",
+    "Your FINAL message must be exactly one JSON object that conforms to this JSON schema:",
+    JSON.stringify(schema),
+    "Return only the JSON object in the final message — no markdown fences, no commentary, no keys beyond the schema.",
+  ].join("\n");
+}
+
+type AssistantContentPart = {
+  readonly type?: unknown;
+  readonly name?: unknown;
+  readonly text?: unknown;
+  readonly state?: { status?: unknown; input?: unknown } | null;
 };
 
-function isStructuredOutputPart(part: unknown): part is StructuredOutputPart {
-  if (typeof part !== "object" || part === null) {
+type AssistantMessage = {
+  readonly type?: unknown;
+  readonly content?: unknown;
+  readonly finish?: unknown;
+  readonly error?: unknown;
+};
+
+function isAssistantMessage(message: unknown): message is AssistantMessage {
+  if (typeof message !== "object" || message === null) {
     return false;
   }
-  const candidate = part as { type?: unknown; tool?: unknown };
-  return candidate.type === "tool" && candidate.tool === "StructuredOutput";
+  return (message as { type?: unknown }).type === "assistant";
 }
 
-// When a prompt is sent with format { type: "json_schema", schema }, opencode
-// does NOT return the object as the prompt's data. It is delivered as the input
-// of a `StructuredOutput` tool call inside the message parts. Return the latest
-// completed input so callers (e.g. PrVerifyHandler) get the parsed object.
-export function extractStructuredOutput(parts: unknown): unknown {
-  if (!Array.isArray(parts)) {
-    return undefined;
+function assistantTextParts(message: AssistantMessage): string[] {
+  if (!Array.isArray(message.content)) {
+    return [];
   }
-  let latest: unknown = undefined;
-  for (const part of parts) {
-    if (isStructuredOutputPart(part) && part.state?.input !== undefined) {
-      latest = part.state.input;
+  const texts: string[] = [];
+  for (const part of message.content as AssistantContentPart[]) {
+    if (typeof part === "object" && part !== null && part.type === "text" && typeof part.text === "string") {
+      texts.push(part.text);
     }
   }
-  return latest;
+  return texts;
 }
 
-// The SDK returns { data, error, response }. When `data` is undefined the
-// reason lives in `error` (e.g. a BadRequest body). Surface it instead of a
-// bare "returned no message" so failures are diagnosable.
-function describeSdkError(error: unknown): string {
-  if (error === undefined) {
-    return "no error body";
+function assistantText(message: AssistantMessage): string {
+  return assistantTextParts(message).join("");
+}
+
+function isStructuredOutputToolPart(part: AssistantContentPart): boolean {
+  return part.type === "tool" && part.name === "StructuredOutput";
+}
+
+// Parses the first JSON value found in a free-text assistant reply, trying the
+// most-likely candidates in order: the whole text, the last fenced block, the
+// outermost {...} span, and each trailing line. Models are told to end with
+// only the JSON object; anything else is a near-miss this recovers from.
+export function extractJsonFromText(text: string): unknown {
+  const trimmed = text.trim();
+  const candidates: string[] = [];
+  if (trimmed.length > 0) {
+    candidates.push(trimmed);
   }
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
+  const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+  if (fenced.length > 0) {
+    const last = fenced[fenced.length - 1][1].trim();
+    if (last.length > 0) {
+      candidates.push(last);
+    }
   }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  const lines = trimmed.split("\n");
+  for (let index = lines.length - 1; index >= 0; index = index - 1) {
+    const line = lines[index].trim();
+    if (line.length > 0) {
+      candidates.push(line);
+    }
+  }
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return undefined;
+}
+
+// Extracts the structured output from a session's message list (newest first,
+// per GET /api/session/{id}/message). Two sources, in order:
+//  1. Compatibility: an assistant tool call named `StructuredOutput` with a
+//     completed input (the V1 delivery shape, in case a server or plugin ever
+//     re-introduces it).
+//  2. The first assistant message (newest first) whose text parses as JSON.
+export function extractStructuredOutput(messages: unknown): unknown {
+  if (!Array.isArray(messages)) {
+    return undefined;
+  }
+  const assistants = messages.filter(isAssistantMessage);
+  for (const message of assistants) {
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    for (const part of message.content as AssistantContentPart[]) {
+      if (typeof part === "object" && part !== null && isStructuredOutputToolPart(part)) {
+        const state = part.state;
+        if (state !== null && state !== undefined && state.input !== undefined && state.input !== null) {
+          return state.input;
+        }
+      }
+    }
+  }
+  for (const message of assistants) {
+    const parsed = extractJsonFromText(assistantText(message));
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+// Validates the outcome of a completed prompt turn and reduces it to the value
+// the runner returns: the parsed structured output, or the final assistant
+// text. Throws when the session produced no assistant message at all (empty
+// turn — retried by sendWithRetry) or when the final assistant turn errored
+// (deterministic failure surfaced to the operator).
+export function extractPromptResult(messages: unknown, structured: boolean): unknown {
+  const list = Array.isArray(messages) ? messages : [];
+  const finalMessage = list.find(isAssistantMessage);
+  if (finalMessage === undefined) {
+    throw new UnexpectedStateError("opencode produced no assistant message for the prompt");
+  }
+  if (finalMessage.error !== undefined && finalMessage.error !== null) {
+    throw new UnexpectedStateError(`opencode assistant turn failed: ${describeJson(finalMessage.error)}`);
+  }
+  if (finalMessage.finish === "error") {
+    throw new UnexpectedStateError("opencode assistant turn failed (finish: error)");
+  }
+  if (structured) {
+    const output = extractStructuredOutput(list);
+    if (output === undefined) {
+      throw new UnexpectedStateError(
+        `Opencode produced no structured output; final assistant text: ${assistantText(finalMessage).slice(0, 500)}`,
+      );
+    }
+    return output;
+  }
+  return assistantText(finalMessage);
 }
 
 type HealthProbeOutcome =
@@ -1100,18 +1386,14 @@ const PROMPT_NETWORK_ERROR_PATTERNS: ReadonlyArray<RegExp> = [
   /network error/i,
 ];
 
-// An opencode prompt can come back with no usable payload in two situations:
-//  (a) the model API errored in a way opencode swallowed (rate limit, transient
-//      5xx, timeout): the SDK yields `data: undefined` AND `error: undefined`,
-//      surfaced as "...: no error body". Transient — safe to retry.
-//  (b) opencode itself failed (e.g. an unknown agent id makes
-//      SessionPrompt.createUserMessage throw): opencode returns 5xx WITH a JSON
-//      error body ({"name":"UnknownError",...}). Deterministic — retrying it
-//      loops until the run timeout (the "attempt 3, delayMs 8000" storm seen
-//      with the invalid "opencode" agent). Do NOT retry.
+// A prompt turn can come back with no usable payload when the session went
+// idle without ever producing an assistant message: the model API errored in a
+// way opencode swallowed, or the wait raced the prompt delivery. Re-asking is
+// safe (a fresh user message simply starts another turn), so it is retried.
+// A turn that ERRORED (finish/error fields) is a surfaced, deterministic
+// failure and must NOT be retried.
 const PROMPT_EMPTY_RESPONSE_PATTERNS: ReadonlyArray<RegExp> = [
-  /returned no message.*no error body/i,
-  /returned no data.*no error body/i,
+  /produced no assistant message/i,
 ];
 
 function causeChainMatches(cause: unknown, patterns: ReadonlyArray<RegExp>): boolean {
