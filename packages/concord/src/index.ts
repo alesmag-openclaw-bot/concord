@@ -346,8 +346,10 @@ export { WorktreeLeaseRegistry, type WorktreeLeases, DEFAULT_FAILED_WORKTREE_HOL
 export { WorktreeGarbageCollector, DEFAULT_WORKTREE_GC_MAX_AGE_MS, type WorktreeGcSummary } from "./infra/adapters/git/worktree-garbage-collector";
 export {
   OpencodeSdkRunner,
+  HttpApiV2OpencodeClientFactory,
   type OpencodeServerSpawner,
   type OpencodeClientFactory,
+  type OpencodeServerAuth,
   type OpencodePromptClient,
   type OpencodeServerHandle,
   type OpencodeRunInputWiring,

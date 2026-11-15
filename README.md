@@ -196,11 +196,14 @@ Anything a handler **throws** is caught by the dispatcher, wrapped in an
 `UnexpectedHandlerError`, and treated as a failed run.
 
 For agent workloads, `AgentTaskRunner` builds on the same contract: it checks
-out a git worktree for the run, drives an [opencode](https://opencode.ai)
-agent in it (with run-scoped ask-a-question and post-update MCP tools),
-applies the produced commits, and reports structured verdicts. The generic
-agent configuration schema (`modelId`, `agentName`, `runTimeoutMs`) is
-resolved per consumer id from persisted consumer configuration.
+out a git worktree for the run, drives an [OpenCode 2.x](https://opencode.ai)
+server in it (spawned per run, authenticated with a per-run
+`OPENCODE_PASSWORD`, with run-scoped ask-a-question and post-update MCP
+tools), applies the produced commits, and reports structured verdicts
+(requested through the prompt text and parsed from the final assistant
+message). The generic agent configuration schema (`modelId`, `agentName`,
+`runTimeoutMs`) is resolved per consumer id from persisted consumer
+configuration.
 
 ## Writing your own producer
 

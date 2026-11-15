@@ -89,9 +89,9 @@ function makeTarget(): { abort: ReturnType<typeof vi.fn>; reason: unknown } {
   };
 }
 
-const TOOL_CALLED = "session.next.tool.called";
-const TOOL_SUCCESS = "session.next.tool.success";
-const TEXT_DELTA = "session.next.text.delta";
+const TOOL_CALLED = "session.tool.called";
+const TOOL_SUCCESS = "session.tool.success";
+const TEXT_DELTA = "session.text.delta";
 
 describe("SessionStallWatchdog", () => {
   it("does NOT abort when the model is idle past the threshold; emits a heartbeat and keeps waiting", () => {
@@ -138,7 +138,7 @@ describe("SessionStallWatchdog", () => {
     // well inside the 180s tool-stall window, for a long time
     for (let t = 60_000; t < 600_000; t += 60_000) {
       clock.now = t;
-      watchdog.observe(event("message.part.updated"));
+      watchdog.observe(event("session.text.delta"));
       scheduler.fire();
     }
     expect(target.abort).not.toHaveBeenCalled();
@@ -272,7 +272,7 @@ describe("SessionStallWatchdog", () => {
     const target = makeTarget();
     watchdog.beginAttempt(target);
     // the model is still producing the tool call input, not executing a tool
-    watchdog.observe(event("session.next.tool.input.delta"));
+    watchdog.observe(event("session.tool.input.delta"));
     clock.now = 60_001;
     scheduler.fire();
     // pendingTools is 0 (only tool.called starts a tool), so the model-idle

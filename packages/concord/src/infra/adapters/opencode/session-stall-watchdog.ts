@@ -34,14 +34,16 @@ import type { OpencodeEvent } from "./opencode-sdk-runner";
 // surfacing the hang as a fast, diagnosable failure instead of waiting out the
 // run timeout.
 
-// opencode event types that bracket tool execution. Sourced from
-// @opencode-ai/sdk's Event union (session.next.tool.*). `tool.input.*` is the
-// model *producing* the call (still model streaming) and is intentionally not
-// counted — only `tool.called` (dispatched) starts a tool and only
+// opencode event types that bracket tool execution, from the OpenCode 2.x
+// V2Event union (https://opencode.ai/docs/api): `session.tool.called` when a
+// tool call is dispatched, `session.tool.success` / `session.tool.failed` when
+// it completes. `session.tool.input.*` deltas keep the idle clock fresh while
+// the model *produces* the call (still model streaming) and are intentionally
+// not counted — only `tool.called` starts a tool and only
 // `tool.success` / `tool.failed` end it.
-const TOOL_CALLED = "session.next.tool.called";
-const TOOL_SUCCESS = "session.next.tool.success";
-const TOOL_FAILED = "session.next.tool.failed";
+const TOOL_CALLED = "session.tool.called";
+const TOOL_SUCCESS = "session.tool.success";
+const TOOL_FAILED = "session.tool.failed";
 
 // Default ratio of tool-stall timeout to model-idle threshold when a caller does
 // not pass an explicit toolStallTimeoutMs. Keeps tests that shorten the model
