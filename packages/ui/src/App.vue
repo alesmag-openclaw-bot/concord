@@ -2,7 +2,7 @@
 import { computed, ref, watch, onMounted } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { FontAwesomeIcon } from "@fortawesome/vue-fontawesome";
-import { faArrowRightFromBracket, faGear, faPause, faPlay } from "@fortawesome/free-solid-svg-icons";
+import { faArrowRightFromBracket, faBars, faGear, faPause, faPlay } from "@fortawesome/free-solid-svg-icons";
 import { useAuthStore } from "./stores/use-auth-store";
 import { useConcordStore } from "./stores/use-concord-store";
 import { computePeakIndicator } from "./infra/peak-indicator";
@@ -132,6 +132,12 @@ function openConfigurationSection(): void {
   openSection("/producers", () => isConfigurationSection.value);
 }
 
+// The hamburger toggles whichever sidebar the current section shows, so the
+// navigation is reachable on mobile without depending on the section icons.
+function toggleMobileSidebar(): void {
+  mobileSidebarOpen.value = !mobileSidebarOpen.value;
+}
+
 function closeMobileSidebar(): void {
   mobileSidebarOpen.value = false;
 }
@@ -160,6 +166,13 @@ function handleSavePeakHours(value: PeakHoursDto | null): void {
     <nav class="h-full w-nav-rail overflow-y-auto">
       <div class="flex h-full flex-col items-center">
         <div class="space-y-8 py-10">
+          <button
+            aria-label="Toggle navigation"
+            class="flex h-9 w-9 cursor-pointer items-center justify-center text-text transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-text md:hidden"
+            @click="toggleMobileSidebar"
+          >
+            <font-awesome-icon :icon="faBars" />
+          </button>
           <button
             aria-label="Concord"
             class="flex h-9 w-9 cursor-pointer items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-text"
@@ -195,8 +208,8 @@ function handleSavePeakHours(value: PeakHoursDto | null): void {
       @click="closeMobileSidebar"
     />
     <aside
-      class="fixed md:static inset-y-0 left-[var(--spacing-nav-rail)] md:left-auto z-40 flex h-full w-sidebar flex-col bg-background transition-transform duration-150 ease-out md:transition-none md:shadow-none"
-      :class="mobileSidebarOpen ? 'translate-x-0 shadow-xl' : '-translate-x-full md:translate-x-0'"
+      class="fixed md:static inset-y-0 left-[var(--spacing-nav-rail)] md:left-auto z-40 flex h-full w-sidebar flex-col bg-background transition-[transform,visibility] duration-150 ease-out md:transition-none md:shadow-none"
+      :class="mobileSidebarOpen ? 'visible translate-x-0 shadow-xl' : 'invisible -translate-x-full md:visible md:translate-x-0'"
     >
       <div class="min-h-0 flex-1 overflow-y-auto pt-4">
         <div v-for="section in sidebarSections" :key="section.title" class="mb-6">

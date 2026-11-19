@@ -617,6 +617,17 @@ export const useConcordStore = defineStore("concord", () => {
       return;
     }
     streamConnected = true;
+    // Per-run subscriptions live in the server per socket. A reconnect gets a
+    // fresh socket with no subscriptions, so re-send every active one each
+    // time the stream opens (including the first open, where the queue may
+    // already have raced the handshake).
+    stream.onOpen(() => {
+      for (const [runId, subscribed] of Object.entries(subscribedRuns.value)) {
+        if (subscribed) {
+          stream.send(JSON.stringify({ type: "subscribe", runId }));
+        }
+      }
+    });
     stream.connect(handleFrame);
     if (peakInterval === null) {
       peakInterval = setInterval(() => {

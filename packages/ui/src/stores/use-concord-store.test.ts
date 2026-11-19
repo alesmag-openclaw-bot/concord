@@ -945,3 +945,70 @@ describe("useConcordStore — run activity", () => {
   });
 });
 
+
+describe("useConcordStore — run activity stream subscriptions", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubSocket(): { socket: { onopen: ((event: unknown) => void) | null; onmessage: ((event: { data: string }) => void) | null; onclose: (() => void) | null; onerror: (() => void) | null; close: ReturnType<typeof vi.fn>; send: ReturnType<typeof vi.fn>; readyState: number }; send: ReturnType<typeof vi.fn> } {
+    const send = vi.fn();
+    const socket = {
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      onerror: null,
+      close: vi.fn(),
+      send,
+      readyState: 0,
+    };
+    vi.stubGlobal("WebSocket", vi.fn().mockImplementation(() => socket));
+    return { socket, send };
+  }
+
+  it("flushes a subscribe that raced the handshake and re-sends it when the socket re-opens", () => {
+    const { socket, send } = stubSocket();
+    const store = useConcordStore();
+    store.connectStream();
+
+    // The socket is still CONNECTING: the subscribe cannot be delivered yet.
+    store.subscribeToRunActivity("run-1");
+    expect(send).not.toHaveBeenCalled();
+
+    socket.readyState = 1;
+    socket.onopen!(undefined);
+    const firstOpenSubscribes = send.mock.calls.filter(([message]) => String(message).includes('"subscribe"') && String(message).includes("run-1"));
+    expect(firstOpenSubscribes.length).toBeGreaterThanOrEqual(1);
+
+    // A reconnect creates a fresh socket with no server-side subscriptions;
+    // the store must re-establish them.
+    send.mockClear();
+    socket.readyState = 1;
+    socket.onopen!(undefined);
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: "subscribe", runId: "run-1" }));
+
+    store.disconnectStream();
+  });
+
+  it("does not re-subscribe a run that was unsubscribed while the socket was down", () => {
+    const { socket, send } = stubSocket();
+    const store = useConcordStore();
+    store.connectStream();
+
+    store.subscribeToRunActivity("run-1");
+    store.unsubscribeFromRunActivity("run-1");
+
+    socket.readyState = 1;
+    socket.onopen!(undefined);
+
+    const delivered = send.mock.calls.map(([message]) => String(message));
+    const lastRunMessage = delivered.filter((message) => message.includes("run-1")).pop();
+    expect(lastRunMessage).toBe(JSON.stringify({ type: "unsubscribe", runId: "run-1" }));
+
+    store.disconnectStream();
+  });
+});

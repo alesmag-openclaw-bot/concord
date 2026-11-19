@@ -8,6 +8,8 @@ interface MockSocket {
   onclose: (() => void) | null;
   onerror: (() => void) | null;
   close: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>;
+  readyState: number;
 }
 
 describe("StreamClient", () => {
@@ -22,6 +24,8 @@ describe("StreamClient", () => {
       onclose: null,
       onerror: null,
       close: vi.fn(),
+      send: vi.fn(),
+      readyState: 0,
     };
     vi.stubGlobal(
       "WebSocket",
@@ -63,6 +67,8 @@ describe("StreamClient", () => {
       onclose: null,
       onerror: null,
       close: vi.fn(),
+      send: vi.fn(),
+      readyState: 0,
     };
     mockSocket = newMock;
     vi.mocked(globalThis.WebSocket).mockImplementation(() => newMock as unknown as WebSocket);
@@ -70,5 +76,45 @@ describe("StreamClient", () => {
     vi.advanceTimersByTime(1000);
 
     expect(vi.mocked(globalThis.WebSocket)).toHaveBeenCalledTimes(2);
+  });
+
+  it("queues a message sent while connecting and flushes it on open", () => {
+    const client = new StreamClient();
+    client.connect(vi.fn());
+    expect(mockSocket.onopen).not.toBeNull();
+
+    const delivered = client.send('{"type":"subscribe","runId":"run-1"}');
+    expect(delivered).toBe(false);
+    expect(mockSocket.send).not.toHaveBeenCalled();
+
+    mockSocket.readyState = 1;
+    mockSocket.onopen!(undefined);
+
+    expect(mockSocket.send).toHaveBeenCalledWith('{"type":"subscribe","runId":"run-1"}');
+  });
+
+  it("notifies open listeners when the socket opens", () => {
+    const client = new StreamClient();
+    const listener = vi.fn();
+    client.onOpen(listener);
+    client.connect(vi.fn());
+
+    mockSocket.readyState = 1;
+    mockSocket.onopen!(undefined);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops queued messages when disconnected", () => {
+    const client = new StreamClient();
+    client.connect(vi.fn());
+
+    client.send('{"type":"subscribe","runId":"run-1"}');
+    client.disconnect();
+
+    mockSocket.readyState = 1;
+    mockSocket.onopen!(undefined);
+
+    expect(mockSocket.send).not.toHaveBeenCalled();
   });
 });

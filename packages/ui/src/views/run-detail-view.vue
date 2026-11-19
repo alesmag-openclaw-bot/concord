@@ -40,6 +40,10 @@ const showActivity = computed(() => {
 });
 
 onMounted(async () => {
+  // Runs are reached by deep links (notifications, reloads) as often as by
+  // in-app navigation, and the live Activity feed depends on the stream
+  // socket. Connect it here, not only from the list views.
+  store.connectStream();
   try {
     run.value = await api.getRun(props.id);
     await Promise.all([store.loadRunForms(props.id), store.loadRunUpdates(props.id)]);
