@@ -194,9 +194,13 @@ function handleSavePeakHours(value: PeakHoursDto | null): void {
       class="fixed inset-0 z-30 bg-black/40 md:hidden"
       @click="closeMobileSidebar"
     />
+    <!-- Closed on mobile, the drawer must clear the viewport entirely. It is
+         anchored at the nav rail's right edge (left: --spacing-nav-rail), so
+         translating by its own width alone (-translate-x-full) leaves a
+         --spacing-nav-rail wide strip on screen at z-40, covering the rail. -->
     <aside
       class="fixed md:static inset-y-0 left-[var(--spacing-nav-rail)] md:left-auto z-40 flex h-full w-sidebar flex-col bg-background transition-transform duration-150 ease-out md:transition-none md:shadow-none"
-      :class="mobileSidebarOpen ? 'translate-x-0 shadow-xl' : '-translate-x-full md:translate-x-0'"
+      :class="mobileSidebarOpen ? 'translate-x-0 shadow-xl' : '-translate-x-[calc(100%_+_var(--spacing-nav-rail))] md:translate-x-0'"
     >
       <div class="min-h-0 flex-1 overflow-y-auto pt-4">
         <div v-for="section in sidebarSections" :key="section.title" class="mb-6">
