@@ -108,8 +108,8 @@ export class StreamBroadcaster implements EventLifecycleObserver, RunActivityEmi
   }
 
   private handleClientMessage(socket: WebSocket, raw: unknown): void {
-    const text = typeof raw === "string" ? raw : undefined;
-    if (text === undefined) {
+    const text = rawClientMessageToText(raw);
+    if (text === null) {
       return;
     }
     const message = safeParseClientMessage(text);
@@ -187,4 +187,24 @@ function safeParseClientMessage(text: string): ClientMessage | null {
     return null;
   }
   return parsed as ClientMessage;
+}
+
+// The ws library delivers text frames as Buffer (RawData), never as a plain
+// string: a message handler that only accepts strings silently drops every
+// client frame, which is exactly how per-run subscriptions were lost. Decode
+// every shape ws can produce; anything else is not a client message.
+function rawClientMessageToText(raw: unknown): string | null {
+  if (typeof raw === "string") {
+    return raw;
+  }
+  if (Buffer.isBuffer(raw)) {
+    return raw.toString("utf8");
+  }
+  if (raw instanceof ArrayBuffer) {
+    return Buffer.from(raw).toString("utf8");
+  }
+  if (Array.isArray(raw) && raw.every((chunk) => Buffer.isBuffer(chunk))) {
+    return Buffer.concat(raw as Buffer[]).toString("utf8");
+  }
+  return null;
 }

@@ -24,12 +24,15 @@ function makeFrame(runId: string): RunActivityFrame {
   };
 }
 
+// The ws library delivers text-frame payloads as Buffer (RawData), so the
+// helpers emit exactly what production delivers — a string payload would let a
+// string-only handler pass the suite while dropping every real client frame.
 function subscribe(socket: FakeSocket, runId: string): void {
-  socket.emit("message", JSON.stringify({ type: "subscribe", runId }));
+  socket.emit("message", Buffer.from(JSON.stringify({ type: "subscribe", runId }), "utf8"));
 }
 
 function unsubscribe(socket: FakeSocket, runId: string): void {
-  socket.emit("message", JSON.stringify({ type: "unsubscribe", runId }));
+  socket.emit("message", Buffer.from(JSON.stringify({ type: "unsubscribe", runId }), "utf8"));
 }
 
 describe("StreamBroadcaster — client set", () => {
@@ -142,14 +145,44 @@ describe("StreamBroadcaster — per-run activity routing", () => {
     const spy = vi.spyOn(socket, "send");
     broadcaster.addClient(socket as unknown as WebSocket);
 
-    socket.emit("message", "not-json");
-    socket.emit("message", JSON.stringify({ type: "unknown", runId: "run-1" }));
-    socket.emit("message", JSON.stringify({ type: "subscribe" }));
-    socket.emit("message", JSON.stringify({ type: "subscribe", runId: "" }));
+    socket.emit("message", Buffer.from("not-json", "utf8"));
+    socket.emit("message", Buffer.from(JSON.stringify({ type: "unknown", runId: "run-1" }), "utf8"));
+    socket.emit("message", Buffer.from(JSON.stringify({ type: "subscribe" }), "utf8"));
+    socket.emit("message", Buffer.from(JSON.stringify({ type: "subscribe", runId: "" }), "utf8"));
 
     // Nothing subscribed, so an emit is a no-op and never reaches send.
     broadcaster.emit(makeFrame("run-1"));
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("registers per-run subscriptions from the binary frames ws delivers (Buffer, not string)", () => {
+    const broadcaster = new StreamBroadcaster();
+    const socket = new FakeSocket(WebSocket.OPEN);
+    const spy = vi.spyOn(socket, "send");
+    broadcaster.addClient(socket as unknown as WebSocket);
+
+    // Real ws message payload: a UTF-8 Buffer carrying the subscribe text.
+    subscribe(socket, "run-bin");
+
+    broadcaster.emit(makeFrame("run-bin"));
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(spy.mock.calls[0][0] as string)).toEqual({
+      type: "run.activity",
+      data: makeFrame("run-bin"),
+    });
+  });
+
+  it("decodes an ArrayBuffer-delivered subscribe frame as well", () => {
+    const broadcaster = new StreamBroadcaster();
+    const socket = new FakeSocket(WebSocket.OPEN);
+    const spy = vi.spyOn(socket, "send");
+    broadcaster.addClient(socket as unknown as WebSocket);
+
+    const text = JSON.stringify({ type: "subscribe", runId: "run-ab" });
+    socket.emit("message", new TextEncoder().encode(text).buffer);
+
+    broadcaster.emit(makeFrame("run-ab"));
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });
 
